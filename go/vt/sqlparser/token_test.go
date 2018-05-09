@@ -18,6 +18,7 @@ package sqlparser
 
 import (
 	"fmt"
+	"reflect"
 	"testing"
 )
 
@@ -186,6 +187,40 @@ func TestSplitStatement(t *testing.T) {
 
 		if tcase.rem != rem {
 			t.Errorf("EndOfStatementPosition(%s) got remainder \"%s\" want \"%s\"", tcase.in, rem, tcase.rem)
+		}
+	}
+}
+
+func TestSplitStatementToSlice(t *testing.T) {
+	testcases := []struct {
+		input  string
+		output []string
+	}{{
+		input:  "select * from table",
+		output: []string{"select * from table"},
+	}, {
+		input:  "select * from table1; select * from table2;",
+		output: []string{"select * from table1", " select * from table2"},
+	}, {
+		input:  "select * from /* comment ; */ table;",
+		output: []string{"select * from /* comment ; */ table"},
+	}, {
+		input:  "select * from table where semi = ';';",
+		output: []string{"select * from table where semi = ';'"},
+	}, {
+		input:  "select * from table1;--comment;\nselect * from table2;",
+		output: []string{"select * from table1", "--comment;\nselect * from table2"},
+	}}
+
+	for _, tcase := range testcases {
+		stmtPieces, err := SplitStatementToSlice(tcase.input)
+		if err != nil {
+			t.Errorf("input: %s, err: %v", tcase.input, err)
+			continue
+		}
+
+		if !reflect.DeepEqual(stmtPieces, tcase.output) {
+			t.Errorf("out: %s, want %s", stmtPieces, tcase.output)
 		}
 	}
 }

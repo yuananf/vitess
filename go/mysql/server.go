@@ -28,6 +28,7 @@ import (
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/stats"
 	"vitess.io/vitess/go/tb"
+	"vitess.io/vitess/go/vt/sqlparser"
 )
 
 const (
@@ -335,60 +336,32 @@ func (l *Listener) handle(conn net.Conn, connectionID uint32, acceptTime time.Ti
 			queryStart := time.Now()
 			query := c.parseComQuery(data)
 			c.recycleReadPacket()
-			fieldSent := false
-			// sendFinished is set if the response should just be an OK packet.
-			sendFinished := false
-			err := l.handler.ComQuery(c, query, func(qr *sqltypes.Result) error {
-				if sendFinished {
-					// Failsafe: Unreachable if server is well-behaved.
-					return io.EOF
-				}
-
-				if !fieldSent {
-					fieldSent = true
-
-					if len(qr.Fields) == 0 {
-						sendFinished = true
-						// We should not send any more packets after this.
-						return c.writeOKPacket(qr.RowsAffected, qr.InsertID, c.StatusFlags, 0)
+			var queries []string
+			if c.Capabilities&CapabilityClientMultiStatements != 0 {
+				stmts, err := sqlparser.SplitStatementToSlice(query)
+				if err != nil {
+					if werr := c.writeErrorPacketFromError(err); werr != nil {
+						// If we can't even write the error, we're done.
+						log.Errorf("Error writing query error to %s: %v", c, werr)
+						return
 					}
-					if err := c.writeFields(qr); err != nil {
-						return err
-					}
+					continue
 				}
-
-				return c.writeRows(qr)
-			})
-
-			// If no field was sent, we expect an error.
-			if !fieldSent {
-				// This is just a failsafe. Should never happen.
-				if err == nil || err == io.EOF {
-					err = NewSQLErrorFromError(errors.New("unexpected: query ended without no results and no error"))
-				}
-				if werr := c.writeErrorPacketFromError(err); werr != nil {
-					// If we can't even write the error, we're done.
-					log.Errorf("Error writing query error to %s: %v", c, werr)
-					return
-				}
-				continue
+				queries = stmts
+			} else {
+				queries = []string{query}
 			}
 
-			if err != nil {
-				// We can't send an error in the middle of a stream.
-				// All we can do is abort the send, which will cause a 2013.
-				log.Errorf("Error in the middle of a stream to %s: %v", c, err)
-				return
-			}
+			for index, sql := range queries {
+				more := false
+				if index != len(queries)-1 {
+					more = true
+				}
 
-			// Send the end packet only sendFinished is false (results were streamed).
-			if !sendFinished {
-				if err := c.writeEndResult(); err != nil {
-					log.Errorf("Error writing result to %s: %v", c, err)
+				if err := l.execQuery(c, sql, more); err != nil {
 					return
 				}
 			}
-
 			timings.Record(queryTimingKey, queryStart)
 
 		case ComPing:
@@ -397,6 +370,31 @@ func (l *Listener) handle(conn net.Conn, connectionID uint32, acceptTime time.Ti
 			if err := c.writeOKPacket(0, 0, c.StatusFlags, 0); err != nil {
 				log.Errorf("Error writing ComPing result to %s: %v", c, err)
 				return
+			}
+		case ComSetOption:
+			if operation, ok := c.parseComSetOption(data); ok {
+				switch operation {
+				case 0:
+					c.Capabilities |= CapabilityClientMultiStatements
+				case 1:
+					c.Capabilities &^= CapabilityClientMultiStatements
+				default:
+					log.Errorf("Got unhandled packet from client %v, returning error: %v", c.ConnectionID, data)
+					if err := c.writeErrorPacket(ERUnknownComError, SSUnknownComError, "error handling packet: %v", data); err != nil {
+						log.Errorf("Error writing error packet to client: %v", err)
+						return
+					}
+				}
+				if err := c.writeEndResult(false); err != nil {
+					log.Errorf("Error writeEndResult error %v ", err)
+					return
+				}
+			} else {
+				log.Errorf("Got unhandled packet from client %v, returning error: %v", c.ConnectionID, data)
+				if err := c.writeErrorPacket(ERUnknownComError, SSUnknownComError, "error handling packet: %v", data); err != nil {
+					log.Errorf("Error writing error packet to client: %v", err)
+					return
+				}
 			}
 		default:
 			log.Errorf("Got unhandled packet from %s, returning error: %v", c, data)
@@ -408,6 +406,67 @@ func (l *Listener) handle(conn net.Conn, connectionID uint32, acceptTime time.Ti
 
 		}
 	}
+}
+
+func (l *Listener) execQuery(c *Conn, sql string, more bool) error {
+	fieldSent := false
+	// sendFinished is set if the response should just be an OK packet.
+	sendFinished := false
+	err := l.handler.ComQuery(c, sql, func(qr *sqltypes.Result) error {
+		flag := c.StatusFlags
+		if more {
+			flag |= ServerMoreResultsExists
+		}
+		if sendFinished {
+			// Failsafe: Unreachable if server is well-behaved.
+			return io.EOF
+		}
+
+		if !fieldSent {
+			fieldSent = true
+
+			if len(qr.Fields) == 0 {
+				sendFinished = true
+				// We should not send any more packets after this.
+				return c.writeOKPacket(qr.RowsAffected, qr.InsertID, flag, 0)
+			}
+			if err := c.writeFields(qr); err != nil {
+				return err
+			}
+		}
+
+		return c.writeRows(qr)
+	})
+
+	// If no field was sent, we expect an error.
+	if !fieldSent {
+		// This is just a failsafe. Should never happen.
+		if err == nil || err == io.EOF {
+			err = NewSQLErrorFromError(errors.New("unexpected: query ended without no results and no error"))
+		}
+		if werr := c.writeErrorPacketFromError(err); werr != nil {
+			// If we can't even write the error, we're done.
+			log.Errorf("Error writing query error to %s: %v", c, werr)
+			return werr
+		}
+		return nil
+	}
+
+	if err != nil {
+		// We can't send an error in the middle of a stream.
+		// All we can do is abort the send, which will cause a 2013.
+		log.Errorf("Error in the middle of a stream to %s: %v", c, err)
+		return err
+	}
+
+	// Send the end packet only sendFinished is false (results were streamed).
+	if !sendFinished {
+		if err := c.writeEndResult(more); err != nil {
+			log.Errorf("Error writing result to %s: %v", c, err)
+			return err
+		}
+	}
+	return nil
 }
 
 // Close stops the listener, and closes all connections.
@@ -424,6 +483,9 @@ func (c *Conn) writeHandshakeV10(serverVersion string, authServer AuthServer, en
 		CapabilityClientProtocol41 |
 		CapabilityClientTransactions |
 		CapabilityClientSecureConnection |
+		CapabilityClientMultiStatements |
+		CapabilityClientMultiResults |
+		CapabilityClientPsMultiResults |
 		CapabilityClientPluginAuth |
 		CapabilityClientPluginAuthLenencClientData |
 		CapabilityClientDeprecateEOF
@@ -528,6 +590,10 @@ func (l *Listener) parseClientHandshakePacket(c *Conn, firstTime bool, data []by
 	// after SSL negotiation, do not overwrite capabilities.
 	if firstTime {
 		c.Capabilities = clientFlags & (CapabilityClientDeprecateEOF | CapabilityClientFoundRows)
+	}
+
+	if clientFlags&CapabilityClientMultiStatements > 0 {
+		c.Capabilities |= CapabilityClientMultiStatements
 	}
 
 	// Max packet size. Don't do anything with this now.
